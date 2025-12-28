@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import TypedDict
 import unittest
+from unittest.mock import patch
+
+from cryptography.hazmat.primitives import serialization
 
 from bluetti_bt_lib.base_devices import BaseDeviceV1
 from bluetti_bt_lib.bluetooth import DeviceReader, DeviceReaderConfig
@@ -20,12 +23,15 @@ class DeviceFixture(TypedDict):
     data: list[tuple[int, str]]
 
 
-def build_device(name: str, fixture_name: str) -> BluettiTestDevice:
+def build_device(name: str, fixture_name: str, encrypted: bool = False) -> BluettiTestDevice:
     data: DeviceFixture = json.loads((FIXTURES_DIR / fixture_name).read_text())
-    register_data = [(e[0], base64.b64decode(e[1])) for e in data["data"]]
-    readable = [range(e[0], e[1]) for e in data["readable_ranges"]]
-    writable = [range(e[0], e[1]) for e in data["writable_ranges"]]
-    return BluettiTestDevice(name, register_data, readable, writable)
+    return BluettiTestDevice(
+        name=name,
+        register_data=[(e[0], base64.b64decode(e[1])) for e in data['data']],
+        readable_ranges=[range(e[0], e[1]) for e in data['readable_ranges']],
+        writable_ranges=[range(e[0], e[1]) for e in data['writable_ranges']],
+        encrypted=encrypted,
+    )
 
 
 class TestDeviceReader(unittest.IsolatedAsyncioTestCase):
@@ -115,3 +121,26 @@ class TestDeviceReader(unittest.IsolatedAsyncioTestCase):
                 ),
                 {10: b""},
             )
+
+    async def test_encrypted_read(self):
+        with build_device("AC3002139000462139", "ac300.json", True) as mock:
+            private_key_l1 = f"{mock.client_key_bundle.signing_key.private_numbers().private_value:X}"
+            public_key_k2 = mock.client_key_bundle.verify_key.public_bytes(encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo).hex()
+            local_aes_key = mock.client_key_bundle.shared_secret.hex()
+
+            with (
+                patch("bluetti_bt_lib.bluetooth.encryption.LOCAL_AES_KEY", new=local_aes_key),
+                patch("bluetti_bt_lib.bluetooth.encryption.PRIVATE_KEY_L1", new=private_key_l1),
+                patch("bluetti_bt_lib.bluetooth.encryption.PUBLIC_KEY_K2", new=public_key_k2),
+            ):
+                device = BaseDeviceV1()
+                reader = DeviceReader(
+                    mock.ble_device.address,
+                    device,
+                    asyncio.get_running_loop().create_future,
+                    DeviceReaderConfig(10, True),
+                )
+                parsed_data = await reader.read(
+                    only_registers=device.get_device_type_registers()
+                )
+                self.assertEqual(parsed_data, {"device_type": "AC300"})

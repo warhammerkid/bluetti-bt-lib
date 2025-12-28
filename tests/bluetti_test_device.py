@@ -13,6 +13,7 @@ from collections import deque
 from collections.abc import Buffer
 from contextlib import ExitStack
 from enum import Enum
+import os
 import struct
 from typing import Literal, Union, assert_never, cast
 import uuid
@@ -29,8 +30,17 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.descriptor import BleakGATTDescriptor
 from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from bluetti_bt_lib.registers import modbus_crc
+from tests.new_encryption import (
+    HandshakeMessage,
+    HandshakeProtocol,
+    HandshakeState,
+    KeyBundle,
+    aes_decrypt,
+    aes_encrypt,
+)
 
 
 class RegisterMemory:
@@ -330,11 +340,13 @@ class BluettiBleakScanner(BaseBleakScanner):
     def __init__(
         self,
         device: BLEDevice,
+        key_bundle: KeyBundle | None,
         detection_callback: AdvertisementDataCallback | None = None,
         service_uuids: list[str] | None = None,
     ) -> None:
         super().__init__(detection_callback, service_uuids)
         self._device = device
+        self._encrypted = key_bundle is not None
 
     async def start(self) -> None:
         # In the current version of Bleak we have to add devices after start
@@ -352,6 +364,8 @@ class BluettiBleakScanner(BaseBleakScanner):
             rssi=-60,
             platform_data=(None,),
         )
+        if self._encrypted:
+            advertisement_data.manufacturer_data[0x4C42] = b"BLUETTF"
         device = self.create_or_update_device(
             "bluetti", self._device.address, name, {}, advertisement_data
         )
@@ -368,14 +382,20 @@ class BluettiBleakClient(BaseBleakClient):
     SERVICE_UUID = "FF00"
     WRITE_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
     NOTIFY_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+    CHALLENGE_ACCEPTED = HandshakeMessage(
+        HandshakeState.CHALLENGE_ACCEPTED, b"\x00"
+    ).bytearray()
 
     def __init__(
         self,
         device: BLEDevice,
+        key_bundle: KeyBundle | None,
         modbus_handler: MODBUSHandler,
         failure_injector: FailureInjector,
     ):
         super().__init__(device)
+        self._key_bundle = key_bundle
+        self._handshake_protocol: HandshakeProtocol | None = None
         self._modbus_handler = modbus_handler
         self._failure_injector = failure_injector
         self._connected: bool = False
@@ -383,7 +403,7 @@ class BluettiBleakClient(BaseBleakClient):
 
     @property
     def mtu_size(self) -> int:
-        return 23
+        return 23 if not self._handshake_protocol else 256
 
     @property
     def is_connected(self) -> bool:
@@ -398,7 +418,7 @@ class BluettiBleakClient(BaseBleakClient):
 
     async def disconnect(self) -> None:
         self._connected = False
-        pass
+        self._handshake_protocol = None
 
     async def get_services(self, **kwargs) -> BleakGATTServiceCollection:
         if self.services is not None:
@@ -413,13 +433,18 @@ class BluettiBleakClient(BaseBleakClient):
                 1,
                 self.WRITE_UUID,
                 ["write", "write-without-response"],
-                lambda: 20,
+                self._max_write_without_response_size,
                 service,
             )
         )
         services.add_characteristic(
             BleakGATTCharacteristic(
-                None, 2, self.NOTIFY_UUID, ["notify"], lambda: 20, service
+                None,
+                2,
+                self.NOTIFY_UUID,
+                ["notify"],
+                self._max_write_without_response_size,
+                service,
             )
         )
         self.services = services
@@ -432,7 +457,18 @@ class BluettiBleakClient(BaseBleakClient):
         callback: NotifyCallback,
         **kwargs,
     ) -> None:
+        # Only allow notify registration for notify characteristic
+        if characteristic.uuid != self.NOTIFY_UUID:
+            raise ValueError("Invalid write characteristic uuid")
+
         self._notification_callbacks[characteristic.uuid] = callback
+
+        # Kick off handshake after registration. Use delayed task for better
+        # simulation of real device flow.
+        if self._key_bundle:
+            self._handshake_protocol = HandshakeProtocol(self._key_bundle)
+            assert (challenge := self._handshake_protocol.handle(None)) is not None
+            self._delayed_notify(challenge)
 
     async def stop_notify(
         self, char_specifier: Union[BleakGATTCharacteristic, int, str, uuid.UUID]
@@ -465,25 +501,40 @@ class BluettiBleakClient(BaseBleakClient):
         if self._failure_injector.should_timeout():
             return
 
+        # If it's encrypted...
+        data_bytes = bytes(data)
+        if self._handshake_protocol:
+            if not self._handshake_protocol.session_aes_key:
+                # If we're still in the handshake protocol, let it handle things
+                self._handle_handshake(data_bytes)
+                return
+            else:
+                # Handshake finished, so automatically decrypt
+                data_bytes = aes_decrypt(
+                    data_bytes, self._handshake_protocol.session_aes_key
+                )
+
         # Process MODBUS command
         override_response = self._failure_injector.get_response_override()
         if override_response is not None:
             response_bytes = override_response
         else:
-            response_bytes = self._modbus_handler.handle_command(bytes(data))
+            response_bytes = self._modbus_handler.handle_command(data_bytes)
         response_data = bytearray(response_bytes)
 
         # Check for CRC corruption
         if self._failure_injector.should_corrupt_crc():
             response_data[-1] ^= 0xFF
 
+        # Encrypt it if we have the session AES key
+        if self._handshake_protocol and self._handshake_protocol.session_aes_key:
+            encrypted = aes_encrypt(
+                response_data, self._handshake_protocol.session_aes_key
+            )
+            response_data = bytearray(encrypted)
+
         # Invoke notification callback with response
-        callback = self._notification_callbacks.get(self.NOTIFY_UUID)
-        if callback:
-            chunk_size = self.mtu_size - 3
-            for i in range(0, len(response_data), chunk_size):
-                chunk = response_data[i : i + chunk_size]
-                callback(chunk)
+        self._notify(response_data)
 
     async def pair(self, *args, **kwargs) -> None:
         raise NotImplementedError()
@@ -507,6 +558,41 @@ class BluettiBleakClient(BaseBleakClient):
         self, descriptor: BleakGATTDescriptor, data: Buffer
     ) -> None:
         raise NotImplementedError()
+
+    def _handle_handshake(self, data: bytes) -> None:
+        assert self._handshake_protocol is not None
+
+        # Generate response - all writes will result in a response
+        # message
+        assert (handshake_response := self._handshake_protocol.handle(data)) is not None
+        self._notify(handshake_response)
+
+        # After the challenge round is done we need to initiate the key exchange
+        # round with a delayed notify
+        if handshake_response == self.CHALLENGE_ACCEPTED:
+            assert (key_round := self._handshake_protocol.handle(None)) is not None
+            self._delayed_notify(key_round)
+
+    def _delayed_notify(self, data: bytearray) -> None:
+        async def send_notify() -> None:
+            self._notify(data)
+
+        self._delayed = asyncio.create_task(send_notify())
+
+    def _notify(self, data: bytearray) -> None:
+        callback = self._notification_callbacks.get(self.NOTIFY_UUID)
+        if not callback:
+            return
+
+        # Split it into chunks that fit inside the MTU and pass to callback
+        chunk_size = self.mtu_size - 3
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i : i + chunk_size]
+            callback(chunk)
+
+    def _max_write_without_response_size(self):
+        """Required for BleakGATTCharacteristic"""
+        return self.mtu_size - 3
 
 
 class BluettiTestDevice:
@@ -532,6 +618,7 @@ class BluettiTestDevice:
         register_data: list[tuple[int, bytes]],
         readable_ranges: list[range],
         writable_ranges: list[range],
+        encrypted: bool,
     ):
         """Initialize the test device.
 
@@ -540,6 +627,8 @@ class BluettiTestDevice:
             register_data: list of (start address, bytes) tuples to fill memory
             readable_ranges: list of readable register ranges
             writable_ranges: list of writable register ranges
+            encrypted: Whether or not the device is encrypted. Client key bundle
+                is available from the `client_key_bundle` property if enabled.
         """
         self._ble_device = MagicMock()
         self._ble_device.name = name
@@ -553,6 +642,19 @@ class BluettiTestDevice:
             self._register_memory, readable_ranges, writable_ranges
         )
 
+        self._server_key_bundle: KeyBundle | None = None
+        self._client_key_bundle: KeyBundle | None = None
+        if encrypted:
+            client_key = ec.generate_private_key(ec.SECP256R1())
+            server_key = ec.generate_private_key(ec.SECP256R1())
+            shared_secret = os.urandom(16)
+            self._server_key_bundle = KeyBundle(
+                server_key, client_key.public_key(), shared_secret
+            )
+            self._client_key_bundle = KeyBundle(
+                client_key, server_key.public_key(), shared_secret
+            )
+
         self._failure_injector = FailureInjector()
 
         self._exit_stack: ExitStack | None = None
@@ -562,6 +664,11 @@ class BluettiTestDevice:
     def ble_device(self) -> BLEDevice:
         """Mock BleakDevice to initialize BleakClient with."""
         return self._ble_device
+
+    @property
+    def client_key_bundle(self) -> KeyBundle | None:
+        """If encryption is enabled, a key bundle to initialize the client with"""
+        return self._client_key_bundle
 
     @property
     def register_memory(self) -> RegisterMemory:
@@ -608,7 +715,10 @@ class BluettiTestDevice:
             **kwargs,
         ):
             return BluettiBleakScanner(
-                self._ble_device, detection_callback, service_uuids
+                self._ble_device,
+                self._server_key_bundle,
+                detection_callback,
+                service_uuids,
             )
 
         self._exit_stack.enter_context(
@@ -620,7 +730,10 @@ class BluettiTestDevice:
 
         # Patch BleakClient
         self._client = BluettiBleakClient(
-            self._ble_device, self._modbus_handler, self._failure_injector
+            self._ble_device,
+            self._server_key_bundle,
+            self._modbus_handler,
+            self._failure_injector,
         )
 
         def mock_client_factory(address_or_ble_device: Union[BLEDevice, str], **kwargs):
